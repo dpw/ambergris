@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -23,8 +24,9 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 2 {
-		fatal("usage: [options] service instances...")
+		fmt.Fprintln(os.Stderr, "usage: [options] service instances...")
 		flag.PrintDefaults()
+		os.Exit(1)
 	}
 
 	cf.setupChain()
@@ -34,12 +36,12 @@ func main() {
 		insts = append(insts, resolve(arg))
 	}
 
-	svc := &service{
-		config:        &cf,
-		serviceAddr:   resolve(flag.Arg(0)),
-		instanceAddrs: insts,
+	fwd, err := cf.newForwarder(resolve(flag.Arg(0)), insts)
+	if err != nil {
+		fatal(err)
 	}
-	svc.startForwarding()
+
+	fatal(<-fwd.errors)
 }
 
 func resolve(addr string) *net.TCPAddr {
@@ -50,43 +52,86 @@ func resolve(addr string) *net.TCPAddr {
 	return res
 }
 
-type service struct {
+func fatal(a ...interface{}) {
+	fmt.Fprintln(os.Stderr, fmt.Sprint(a...))
+	os.Exit(1)
+}
+
+type forwarder struct {
 	config        *config
 	serviceAddr   *net.TCPAddr
 	instanceAddrs []*net.TCPAddr
+	errors        <-chan error
+
+	lock     sync.Mutex
+	listener *net.TCPListener
+	closed   chan struct{}
 }
 
-func (svc *service) startForwarding() {
-	bridgeIP, err := svc.config.bridgeIP()
+func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*net.TCPAddr) (*forwarder, error) {
+	bridgeIP, err := config.bridgeIP()
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 
-	local, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
 	if err != nil {
-		fatal("cannot listen:", err)
+		return nil, err
 	}
 
-	localAddr := local.Addr().(*net.TCPAddr)
-	err = svc.config.addRule("-p", "tcp", "-d", svc.serviceAddr.IP,
-		"--dport", svc.serviceAddr.Port, "-j", "DNAT",
-		"--to-destination", localAddr)
+	localAddr := listener.Addr().(*net.TCPAddr)
+
+	rule := []interface{}{
+		"-p", "tcp",
+		"-d", serviceAddr.IP,
+		"--dport", serviceAddr.Port,
+		"-j", "DNAT",
+		"--to-destination", localAddr,
+	}
+	err = config.addRule(rule)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 
-	for {
-		conn, err := local.AcceptTCP()
-		if err != nil {
-			fatal("accept failed:", err)
+	defer func() {
+		if rule != nil {
+			config.deleteRule(rule)
 		}
-		fmt.Println("Got connection")
-		go svc.forward(conn)
+	}()
+
+	errors := make(chan error)
+
+	fwd := &forwarder{
+		config:        config,
+		serviceAddr:   serviceAddr,
+		instanceAddrs: instanceAddrs,
+		errors:        errors,
+
+		listener: listener,
+		closed:   make(chan struct{}),
 	}
+
+	go func() {
+		for {
+			conn, err := listener.AcceptTCP()
+			if err != nil {
+				select {
+				case errors <- err:
+				case <-fwd.closed:
+				}
+				return
+			}
+
+			go fwd.forward(conn)
+		}
+	}()
+
+	rule = nil
+	return fwd, nil
 }
 
-func (svc *service) forward(local *net.TCPConn) {
-	addr := svc.instanceAddrs[rand.Intn(len(svc.instanceAddrs))]
+func (fwd *forwarder) forward(local *net.TCPConn) {
+	addr := fwd.instanceAddrs[rand.Intn(len(fwd.instanceAddrs))]
 	remote, err := net.DialTCP("tcp", nil, addr)
 	if remote == nil {
 		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
@@ -110,9 +155,15 @@ func (svc *service) forward(local *net.TCPConn) {
 	remote.Close()
 }
 
-func fatal(a ...interface{}) {
-	fmt.Fprintln(os.Stderr, fmt.Sprint(a...))
-	os.Exit(1)
+func (fwd *forwarder) close() {
+	fwd.lock.Lock()
+	defer fwd.lock.Unlock()
+
+	if fwd.listener != nil {
+		fwd.listener.Close()
+		close(fwd.closed)
+		fwd.listener = nil
+	}
 }
 
 type ipTablesError struct {
@@ -215,7 +266,15 @@ func (cf *config) setupChain() error {
 		"-j", cf.chain)
 }
 
-func (cf *config) addRule(args ...interface{}) error {
-	prefix := []interface{}{"-t", "nat", "-A", cf.chain}
+func (cf *config) addRule(args []interface{}) error {
+	return cf.frobRule("-A", args)
+}
+
+func (cf *config) deleteRule(args []interface{}) error {
+	return cf.frobRule("-D", args)
+}
+
+func (cf *config) frobRule(op string, args []interface{}) error {
+	prefix := []interface{}{"-t", "nat", op, cf.chain}
 	return doIPTables(append(prefix, args...)...)
 }
