@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -12,24 +13,30 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fatal("usage: service instances...")
+	var cf config
+
+	// The bridge specified should be the one where packets sent
+	// to service IP addresses go.  So even with weave, that's
+	// typically 'docker0'.
+	flag.StringVar(&cf.bridge, "bridge", "docker0", "bridge device")
+	flag.StringVar(&cf.chain, "chain", "AMBERGRIS", "iptables chain name")
+	flag.Parse()
+
+	if flag.NArg() < 2 {
+		fatal("usage: [options] service instances...")
+		flag.PrintDefaults()
 	}
 
-	cf := &config{
-		chain:  "AMBERGRIS",
-		bridge: "docker0",
-	}
 	cf.setupChain()
 
 	var insts []*net.TCPAddr
-	for _, arg := range os.Args[2:] {
+	for _, arg := range flag.Args()[1:] {
 		insts = append(insts, resolve(arg))
 	}
 
 	svc := &service{
-		config:        cf,
-		serviceAddr:   resolve(os.Args[1]),
+		config:        &cf,
+		serviceAddr:   resolve(flag.Arg(0)),
 		instanceAddrs: insts,
 	}
 	svc.startForwarding()
@@ -50,18 +57,20 @@ type service struct {
 }
 
 func (svc *service) startForwarding() {
-	// XXX should just listen on the bridge ip
+	bridgeIP, err := svc.config.bridgeIP()
+	if err != nil {
+		fatal(err)
+	}
 
-	local, err := net.ListenTCP("tcp", nil)
-	if local == nil {
+	local, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
+	if err != nil {
 		fatal("cannot listen:", err)
 	}
 
 	localAddr := local.Addr().(*net.TCPAddr)
 	err = svc.config.addRule("-p", "tcp", "-d", svc.serviceAddr.IP,
 		"--dport", svc.serviceAddr.Port, "-j", "DNAT",
-		"--to-destination",
-		fmt.Sprint(svc.config.bridgeAddr(), ":", localAddr.Port))
+		"--to-destination", localAddr)
 	if err != nil {
 		fatal(err)
 	}
@@ -71,6 +80,7 @@ func (svc *service) startForwarding() {
 		if err != nil {
 			fatal("accept failed:", err)
 		}
+		fmt.Println("Got connection")
 		go svc.forward(conn)
 	}
 }
@@ -151,8 +161,26 @@ type config struct {
 	bridge string
 }
 
-func (cg *config) bridgeAddr() net.IP {
-	return net.ParseIP("172.17.42.1")
+func (cf *config) bridgeIP() (net.IP, error) {
+	iface, err := net.InterfaceByName(cf.bridge)
+	if err != nil {
+		return nil, err
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, addr := range addrs {
+		if cidr, ok := addr.(*net.IPNet); ok {
+			if ip := cidr.IP.To4(); ip != nil {
+				return ip, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no IPv4 address found on netdev %s", cf.bridge)
 }
 
 func (cf *config) setupChain() error {
@@ -171,6 +199,7 @@ func (cf *config) setupChain() error {
 	}
 
 	// Is the chain already hooked into PREROUTING?
+	// XXX what if it is hooked in for another bridge?
 	err = doIPTables("-t", "nat", "-C", "PREROUTING", "-i", cf.bridge,
 		"-j", cf.chain)
 	if err == nil {
