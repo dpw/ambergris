@@ -29,7 +29,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	cf.setupChain()
+	err := cf.setupChain()
+	if err != nil {
+		fatal(err)
+	}
 
 	var insts []*net.TCPAddr
 	for _, arg := range flag.Args()[1:] {
@@ -174,13 +177,21 @@ func (err ipTablesError) Error() string {
 	return fmt.Sprint("iptables error: ", err.output)
 }
 
-func doIPTables(args ...interface{}) error {
-	sargs := make([]string, len(args))
-	for i, arg := range args {
-		sargs[i] = fmt.Sprint(arg)
+func flatten(args []interface{}, onto []string) []string {
+	for _, arg := range args {
+		switch argt := arg.(type) {
+		case []interface{}:
+			onto = flatten(argt, onto)
+		default:
+			onto = append(onto, fmt.Sprint(arg))
+		}
 	}
+	return onto
+}
 
-	output, err := exec.Command("iptables", sargs...).CombinedOutput()
+func doIPTables(args ...interface{}) error {
+	flatArgs := flatten(args, nil)
+	output, err := exec.Command("iptables", flatArgs...).CombinedOutput()
 	switch errt := err.(type) {
 	case nil:
 	case *exec.ExitError:
@@ -188,7 +199,7 @@ func doIPTables(args ...interface{}) error {
 			// sanitize iptables output
 			limit := 200
 			sanOut := strings.Map(func(ch rune) rune {
-				if limit > 0 {
+				if limit == 0 {
 					return -1
 				}
 				limit--
@@ -235,35 +246,46 @@ func (cf *config) bridgeIP() (net.IP, error) {
 }
 
 func (cf *config) setupChain() error {
-	// Remove any rules in our chain
-	err := doIPTables("-t", "nat", "-F", cf.chain)
+	refRule := []interface{}{"-i", cf.bridge, "-j", cf.chain}
+	err := cf.deleteChain(refRule)
 	if err != nil {
-		if _, ok := err.(ipTablesError); !ok {
-			return err
-		}
-
-		// Need to create our chain
-		err = doIPTables("-t", "nat", "-N", cf.chain)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Is the chain already hooked into PREROUTING?
-	// XXX what if it is hooked in for another bridge?
-	err = doIPTables("-t", "nat", "-C", "PREROUTING", "-i", cf.bridge,
-		"-j", cf.chain)
-	if err == nil {
-		// it's there already
-		return nil
-	}
-
-	if _, ok := err.(ipTablesError); !ok {
 		return err
 	}
 
-	return doIPTables("-t", "nat", "-A", "PREROUTING", "-i", cf.bridge,
-		"-j", cf.chain)
+	err = doIPTables("-t", "nat", "-N", cf.chain)
+	if err != nil {
+		return err
+	}
+
+	return doIPTables("-t", "nat", "-A", "PREROUTING", refRule)
+}
+
+func (cf *config) deleteChain(refRule []interface{}) error {
+	// First, remove any rules in the chain
+	err := doIPTables("-t", "nat", "-F", cf.chain)
+	if err != nil {
+		if _, ok := err.(ipTablesError); !ok {
+			// this probably means the chain doesn't exist
+			return nil
+		}
+	}
+
+	// Remove the rule that references our chain from PREROUTING,
+	// if it's there.
+	for {
+		err := doIPTables("-t", "nat", "-D", "PREROUTING", refRule)
+		if err != nil {
+			if _, ok := err.(ipTablesError); !ok {
+				return err
+			}
+
+			// a "no such rule" error
+			break
+		}
+	}
+
+	// Actually delete the chain at last
+	return doIPTables("-t", "nat", "-X", cf.chain)
 }
 
 func (cf *config) addRule(args []interface{}) error {
@@ -275,6 +297,5 @@ func (cf *config) deleteRule(args []interface{}) error {
 }
 
 func (cf *config) frobRule(op string, args []interface{}) error {
-	prefix := []interface{}{"-t", "nat", op, cf.chain}
-	return doIPTables(append(prefix, args...)...)
+	return doIPTables("-t", "nat", op, cf.chain, args)
 }
