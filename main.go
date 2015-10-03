@@ -8,8 +8,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"unicode"
 )
 
@@ -44,7 +46,16 @@ func main() {
 		fatal(err)
 	}
 
-	fatal(<-fwd.errors)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sigs:
+	case err := <-fwd.errors:
+		fatal(err)
+	}
+
+	fwd.close()
+	cf.deleteChain()
 }
 
 func resolve(addr string) *net.TCPAddr {
@@ -68,6 +79,7 @@ type forwarder struct {
 
 	lock     sync.Mutex
 	listener *net.TCPListener
+	rule     []interface{}
 	closed   chan struct{}
 }
 
@@ -77,42 +89,40 @@ func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*ne
 		return nil, err
 	}
 
+	errors := make(chan error)
+	fwd := &forwarder{
+		config:        config,
+		serviceAddr:   serviceAddr,
+		instanceAddrs: instanceAddrs,
+		errors:        errors,
+		closed:        make(chan struct{}),
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			fwd.close()
+		}
+	}()
+
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
 	if err != nil {
 		return nil, err
 	}
-
-	localAddr := listener.Addr().(*net.TCPAddr)
+	fwd.listener = listener
 
 	rule := []interface{}{
 		"-p", "tcp",
 		"-d", serviceAddr.IP,
 		"--dport", serviceAddr.Port,
 		"-j", "DNAT",
-		"--to-destination", localAddr,
+		"--to-destination", listener.Addr(),
 	}
 	err = config.addRule(rule)
 	if err != nil {
 		return nil, err
 	}
-
-	defer func() {
-		if rule != nil {
-			config.deleteRule(rule)
-		}
-	}()
-
-	errors := make(chan error)
-
-	fwd := &forwarder{
-		config:        config,
-		serviceAddr:   serviceAddr,
-		instanceAddrs: instanceAddrs,
-		errors:        errors,
-
-		listener: listener,
-		closed:   make(chan struct{}),
-	}
+	fwd.rule = rule
 
 	go func() {
 		for {
@@ -129,7 +139,7 @@ func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*ne
 		}
 	}()
 
-	rule = nil
+	success = true
 	return fwd, nil
 }
 
@@ -167,14 +177,20 @@ func (fwd *forwarder) close() {
 		close(fwd.closed)
 		fwd.listener = nil
 	}
+
+	if fwd.rule != nil {
+		fwd.config.deleteRule(fwd.rule)
+		fwd.rule = nil
+	}
 }
 
 type ipTablesError struct {
+	cmd    string
 	output string
 }
 
 func (err ipTablesError) Error() string {
-	return fmt.Sprint("iptables error: ", err.output)
+	return fmt.Sprintf("'iptables %s' gave error: ", err.cmd, err.output)
 }
 
 func flatten(args []interface{}, onto []string) []string {
@@ -209,7 +225,10 @@ func doIPTables(args ...interface{}) error {
 				}
 				return ch
 			}, string(output))
-			return ipTablesError{sanOut}
+			return ipTablesError{
+				cmd:    strings.Join(flatArgs, " "),
+				output: sanOut,
+			}
 		}
 	default:
 		return err
@@ -245,9 +264,12 @@ func (cf *config) bridgeIP() (net.IP, error) {
 	return nil, fmt.Errorf("no IPv4 address found on netdev %s", cf.bridge)
 }
 
+func (cf *config) chainRule() []interface{} {
+	return []interface{}{"-i", cf.bridge, "-j", cf.chain}
+}
+
 func (cf *config) setupChain() error {
-	refRule := []interface{}{"-i", cf.bridge, "-j", cf.chain}
-	err := cf.deleteChain(refRule)
+	err := cf.deleteChain()
 	if err != nil {
 		return err
 	}
@@ -257,14 +279,14 @@ func (cf *config) setupChain() error {
 		return err
 	}
 
-	return doIPTables("-t", "nat", "-A", "PREROUTING", refRule)
+	return doIPTables("-t", "nat", "-A", "PREROUTING", cf.chainRule())
 }
 
-func (cf *config) deleteChain(refRule []interface{}) error {
+func (cf *config) deleteChain() error {
 	// First, remove any rules in the chain
 	err := doIPTables("-t", "nat", "-F", cf.chain)
 	if err != nil {
-		if _, ok := err.(ipTablesError); !ok {
+		if _, ok := err.(ipTablesError); ok {
 			// this probably means the chain doesn't exist
 			return nil
 		}
@@ -273,7 +295,8 @@ func (cf *config) deleteChain(refRule []interface{}) error {
 	// Remove the rule that references our chain from PREROUTING,
 	// if it's there.
 	for {
-		err := doIPTables("-t", "nat", "-D", "PREROUTING", refRule)
+		err := doIPTables("-t", "nat", "-D", "PREROUTING",
+			cf.chainRule())
 		if err != nil {
 			if _, ok := err.(ipTablesError); !ok {
 				return err
