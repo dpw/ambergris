@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,76 @@ import (
 	"unicode"
 )
 
+type IPPort struct {
+	// stringified form of the IP bytes, to be used as a map key
+	ip   string
+	Port int
+}
+
+func (ipport IPPort) IP() net.IP {
+	return net.IP(([]byte)(ipport.ip))
+}
+
+func (ipport IPPort) TCPAddr() *net.TCPAddr {
+	return &net.TCPAddr{IP: ipport.IP(), Port: ipport.Port}
+}
+
+type Instance struct {
+	IPPort
+}
+
+func MakeInstance(ip net.IP, port int) Instance {
+	return Instance{IPPort{string(ip), port}}
+}
+
+type ServiceKey struct {
+	// Type of the service, e.g. "tcp" or "udp"
+	Type string
+	IPPort
+}
+
+func MakeServiceKey(typ string, ip net.IP, port int) ServiceKey {
+	return ServiceKey{typ, IPPort{string(ip), port}}
+}
+
+type ServiceInfo struct {
+	// Protocol, e.g. "http".  "" for simple tcp forwarding.
+	Protocol  string
+	Instances []Instance
+}
+
+type ServiceUpdate struct {
+	ServiceKey
+	*ServiceInfo
+}
+
+func parseService(s []string) (ServiceUpdate, error) {
+	var res ServiceUpdate
+	if len(s) < 1 {
+		return res, fmt.Errorf("service specification should begin with port:ip-address")
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", s[0])
+	if err != nil {
+		return res, err
+	}
+
+	res.ServiceKey = MakeServiceKey("tcp", addr.IP, addr.Port)
+	res.ServiceInfo = &ServiceInfo{}
+
+	for _, inst := range s[1:] {
+		addr, err := net.ResolveTCPAddr("tcp", inst)
+		if err != nil {
+			return res, err
+		}
+
+		res.Instances = append(res.Instances,
+			MakeInstance(addr.IP, addr.Port))
+	}
+
+	return res, nil
+}
+
 func main() {
 	var cf config
 
@@ -25,45 +96,120 @@ func main() {
 	flag.StringVar(&cf.chain, "chain", "AMBERGRIS", "iptables chain name")
 	flag.Parse()
 
-	if flag.NArg() < 2 {
-		fmt.Fprintln(os.Stderr, "usage: [options] service instances...")
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-
-	err := cf.setupChain()
+	upd, err := parseService(flag.Args())
 	if err != nil {
 		fatal(err)
 	}
 
-	var insts []*net.TCPAddr
-	for _, arg := range flag.Args()[1:] {
-		insts = append(insts, resolve(arg))
-	}
-
-	fwd, err := cf.newForwarder(resolve(flag.Arg(0)), insts)
+	err = cf.setupChain()
 	if err != nil {
 		fatal(err)
 	}
+
+	errors := make(chan error, 1)
+	updates := make(chan ServiceUpdate, 1)
+	updater := cf.newUpdater(updates, errors)
+	updates <- upd
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go readLines(updates, errors)
+
 	select {
 	case <-sigs:
-	case err := <-fwd.errors:
+	case err := <-errors:
 		fatal(err)
 	}
 
-	fwd.close()
+	updater.close()
 	cf.deleteChain()
 }
 
-func resolve(addr string) *net.TCPAddr {
-	res, err := net.ResolveTCPAddr("tcp", addr)
-	if err != nil {
-		fatal("cannot resolve ", addr, ":", err)
+func readLines(updates chan<- ServiceUpdate, errors chan<- error) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		upd, err := parseService(strings.Split(scanner.Text(), " "))
+		if err != nil {
+			errors <- err
+			return
+		}
+
+		updates <- upd
 	}
-	return res
+}
+
+type updater struct {
+	config  *config
+	updates <-chan ServiceUpdate
+	errors  chan<- error
+
+	lock     sync.Mutex
+	closed   chan struct{}
+	finished chan struct{}
+	services map[ServiceKey]*service
+}
+
+func (config *config) newUpdater(updates <-chan ServiceUpdate, errors chan<- error) *updater {
+	upd := &updater{
+		config:   config,
+		updates:  updates,
+		errors:   errors,
+		closed:   make(chan struct{}),
+		finished: make(chan struct{}),
+		services: make(map[ServiceKey]*service),
+	}
+	go upd.run()
+	return upd
+}
+
+func (upd *updater) close() {
+	upd.lock.Lock()
+	defer upd.lock.Unlock()
+
+	if upd.services != nil {
+		close(upd.closed)
+		<-upd.finished
+
+		for _, svc := range upd.services {
+			svc.close()
+		}
+	}
+}
+
+func (upd *updater) run() {
+	for {
+		select {
+		case <-upd.closed:
+			close(upd.finished)
+			return
+
+		case update := <-upd.updates:
+			upd.doUpdate(update)
+		}
+	}
+}
+
+func (upd *updater) doUpdate(update ServiceUpdate) {
+	svc := upd.services[update.ServiceKey]
+	if svc == nil {
+		if update.ServiceInfo == nil {
+			return
+		}
+
+		svc, err := upd.config.newService(update, upd.errors)
+		if err != nil {
+			upd.errors <- err
+			return
+		}
+
+		upd.services[update.ServiceKey] = svc
+	} else if update.ServiceInfo != nil {
+		svc.update(*update.ServiceInfo)
+	} else {
+		delete(upd.services, update.ServiceKey)
+		svc.close()
+	}
 }
 
 func fatal(a ...interface{}) {
@@ -71,11 +217,11 @@ func fatal(a ...interface{}) {
 	os.Exit(1)
 }
 
-type forwarder struct {
-	config        *config
-	serviceAddr   *net.TCPAddr
-	instanceAddrs []*net.TCPAddr
-	errors        <-chan error
+type service struct {
+	config      *config
+	serviceAddr *net.TCPAddr
+	instances   []Instance
+	errors      chan<- error
 
 	lock     sync.Mutex
 	listener *net.TCPListener
@@ -83,25 +229,24 @@ type forwarder struct {
 	closed   chan struct{}
 }
 
-func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*net.TCPAddr) (*forwarder, error) {
+func (config *config) newService(upd ServiceUpdate, errors chan<- error) (*service, error) {
 	bridgeIP, err := config.bridgeIP()
 	if err != nil {
 		return nil, err
 	}
 
-	errors := make(chan error)
-	fwd := &forwarder{
-		config:        config,
-		serviceAddr:   serviceAddr,
-		instanceAddrs: instanceAddrs,
-		errors:        errors,
-		closed:        make(chan struct{}),
+	svc := &service{
+		config:      config,
+		serviceAddr: upd.TCPAddr(),
+		instances:   upd.Instances,
+		errors:      errors,
+		closed:      make(chan struct{}),
 	}
 
 	success := false
 	defer func() {
 		if !success {
-			fwd.close()
+			svc.close()
 		}
 	}()
 
@@ -109,12 +254,12 @@ func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*ne
 	if err != nil {
 		return nil, err
 	}
-	fwd.listener = listener
+	svc.listener = listener
 
 	rule := []interface{}{
 		"-p", "tcp",
-		"-d", serviceAddr.IP,
-		"--dport", serviceAddr.Port,
+		"-d", upd.IP(),
+		"--dport", upd.Port,
 		"-j", "DNAT",
 		"--to-destination", listener.Addr(),
 	}
@@ -122,7 +267,7 @@ func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*ne
 	if err != nil {
 		return nil, err
 	}
-	fwd.rule = rule
+	svc.rule = rule
 
 	go func() {
 		for {
@@ -130,22 +275,21 @@ func (config *config) newForwarder(serviceAddr *net.TCPAddr, instanceAddrs []*ne
 			if err != nil {
 				select {
 				case errors <- err:
-				case <-fwd.closed:
+				case <-svc.closed:
 				}
 				return
 			}
 
-			go fwd.forward(conn)
+			go svc.forward(conn)
 		}
 	}()
 
 	success = true
-	return fwd, nil
+	return svc, nil
 }
 
-func (fwd *forwarder) forward(local *net.TCPConn) {
-	addr := fwd.instanceAddrs[rand.Intn(len(fwd.instanceAddrs))]
-	remote, err := net.DialTCP("tcp", nil, addr)
+func (svc *service) forward(local *net.TCPConn) {
+	remote, err := net.DialTCP("tcp", nil, svc.pickInstance().TCPAddr())
 	if remote == nil {
 		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
 		return
@@ -154,12 +298,14 @@ func (fwd *forwarder) forward(local *net.TCPConn) {
 	ch := make(chan struct{})
 	go func() {
 		io.Copy(local, remote)
+		// XXX report error
 		remote.CloseRead()
 		local.CloseWrite()
 		close(ch)
 	}()
 
 	io.Copy(remote, local)
+	// XXX report error
 	local.CloseRead()
 	remote.CloseWrite()
 
@@ -168,19 +314,31 @@ func (fwd *forwarder) forward(local *net.TCPConn) {
 	remote.Close()
 }
 
-func (fwd *forwarder) close() {
-	fwd.lock.Lock()
-	defer fwd.lock.Unlock()
+func (svc *service) pickInstance() Instance {
+	svc.lock.Lock()
+	defer svc.lock.Unlock()
+	return svc.instances[rand.Intn(len(svc.instances))]
+}
 
-	if fwd.listener != nil {
-		fwd.listener.Close()
-		close(fwd.closed)
-		fwd.listener = nil
+func (svc *service) update(info ServiceInfo) {
+	svc.lock.Lock()
+	defer svc.lock.Unlock()
+	svc.instances = info.Instances
+}
+
+func (svc *service) close() {
+	svc.lock.Lock()
+	defer svc.lock.Unlock()
+
+	if svc.listener != nil {
+		svc.listener.Close()
+		close(svc.closed)
+		svc.listener = nil
 	}
 
-	if fwd.rule != nil {
-		fwd.config.deleteRule(fwd.rule)
-		fwd.rule = nil
+	if svc.rule != nil {
+		svc.config.deleteRule(svc.rule)
+		svc.rule = nil
 	}
 }
 
