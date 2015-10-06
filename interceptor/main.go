@@ -1,4 +1,4 @@
-package main
+package interceptor
 
 import (
 	"bufio"
@@ -8,85 +8,18 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
-	"unicode"
 )
 
-type IPPort struct {
-	// stringified form of the IP bytes, to be used as a map key
-	ip   string
-	Port int
+type config struct {
+	chain  string
+	bridge string
 }
 
-func (ipport IPPort) IP() net.IP {
-	return net.IP(([]byte)(ipport.ip))
-}
-
-func (ipport IPPort) TCPAddr() *net.TCPAddr {
-	return &net.TCPAddr{IP: ipport.IP(), Port: ipport.Port}
-}
-
-type Instance struct {
-	IPPort
-}
-
-func MakeInstance(ip net.IP, port int) Instance {
-	return Instance{IPPort{string(ip), port}}
-}
-
-type ServiceKey struct {
-	// Type of the service, e.g. "tcp" or "udp"
-	Type string
-	IPPort
-}
-
-func MakeServiceKey(typ string, ip net.IP, port int) ServiceKey {
-	return ServiceKey{typ, IPPort{string(ip), port}}
-}
-
-type ServiceInfo struct {
-	// Protocol, e.g. "http".  "" for simple tcp forwarding.
-	Protocol  string
-	Instances []Instance
-}
-
-type ServiceUpdate struct {
-	ServiceKey
-	*ServiceInfo
-}
-
-func parseService(s []string) (ServiceUpdate, error) {
-	var res ServiceUpdate
-	if len(s) < 1 {
-		return res, fmt.Errorf("service specification should begin with port:ip-address")
-	}
-
-	addr, err := net.ResolveTCPAddr("tcp", s[0])
-	if err != nil {
-		return res, err
-	}
-
-	res.ServiceKey = MakeServiceKey("tcp", addr.IP, addr.Port)
-	res.ServiceInfo = &ServiceInfo{}
-
-	for _, inst := range s[1:] {
-		addr, err := net.ResolveTCPAddr("tcp", inst)
-		if err != nil {
-			return res, err
-		}
-
-		res.Instances = append(res.Instances,
-			MakeInstance(addr.IP, addr.Port))
-	}
-
-	return res, nil
-}
-
-func main() {
+func Main() {
 	var cf config
 
 	// The bridge specified should be the one where packets sent
@@ -124,6 +57,33 @@ func main() {
 
 	updater.close()
 	cf.deleteChain()
+}
+
+func parseService(s []string) (ServiceUpdate, error) {
+	var res ServiceUpdate
+	if len(s) < 1 {
+		return res, fmt.Errorf("service specification should begin with port:ip-address")
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", s[0])
+	if err != nil {
+		return res, err
+	}
+
+	res.ServiceKey = MakeServiceKey("tcp", addr.IP, addr.Port)
+	res.ServiceInfo = &ServiceInfo{}
+
+	for _, inst := range s[1:] {
+		addr, err := net.ResolveTCPAddr("tcp", inst)
+		if err != nil {
+			return res, err
+		}
+
+		res.Instances = append(res.Instances,
+			MakeInstance(addr.IP, addr.Port))
+	}
+
+	return res, nil
 }
 
 func readLines(updates chan<- ServiceUpdate, errors chan<- error) {
@@ -291,6 +251,7 @@ func (config *config) newService(upd ServiceUpdate, errors chan<- error) (*servi
 func (svc *service) forward(local *net.TCPConn) {
 	remote, err := net.DialTCP("tcp", nil, svc.pickInstance().TCPAddr())
 	if remote == nil {
+		// XXX report error
 		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
 		return
 	}
@@ -321,6 +282,8 @@ func (svc *service) pickInstance() Instance {
 }
 
 func (svc *service) update(info ServiceInfo) {
+	// handle the "no instances" case nicely, by changing the rule to
+	// REJECT.
 	svc.lock.Lock()
 	defer svc.lock.Unlock()
 	svc.instances = info.Instances
@@ -340,64 +303,6 @@ func (svc *service) close() {
 		svc.config.deleteRule(svc.rule)
 		svc.rule = nil
 	}
-}
-
-type ipTablesError struct {
-	cmd    string
-	output string
-}
-
-func (err ipTablesError) Error() string {
-	return fmt.Sprintf("'iptables %s' gave error: ", err.cmd, err.output)
-}
-
-func flatten(args []interface{}, onto []string) []string {
-	for _, arg := range args {
-		switch argt := arg.(type) {
-		case []interface{}:
-			onto = flatten(argt, onto)
-		default:
-			onto = append(onto, fmt.Sprint(arg))
-		}
-	}
-	return onto
-}
-
-func doIPTables(args ...interface{}) error {
-	flatArgs := flatten(args, nil)
-	output, err := exec.Command("iptables", flatArgs...).CombinedOutput()
-	switch errt := err.(type) {
-	case nil:
-	case *exec.ExitError:
-		if !errt.Success() {
-			// sanitize iptables output
-			limit := 200
-			sanOut := strings.Map(func(ch rune) rune {
-				if limit == 0 {
-					return -1
-				}
-				limit--
-
-				if unicode.IsControl(ch) {
-					ch = ' '
-				}
-				return ch
-			}, string(output))
-			return ipTablesError{
-				cmd:    strings.Join(flatArgs, " "),
-				output: sanOut,
-			}
-		}
-	default:
-		return err
-	}
-
-	return nil
-}
-
-type config struct {
-	chain  string
-	bridge string
 }
 
 func (cf *config) bridgeIP() (net.IP, error) {
@@ -420,63 +325,4 @@ func (cf *config) bridgeIP() (net.IP, error) {
 	}
 
 	return nil, fmt.Errorf("no IPv4 address found on netdev %s", cf.bridge)
-}
-
-func (cf *config) chainRule() []interface{} {
-	return []interface{}{"-i", cf.bridge, "-j", cf.chain}
-}
-
-func (cf *config) setupChain() error {
-	err := cf.deleteChain()
-	if err != nil {
-		return err
-	}
-
-	err = doIPTables("-t", "nat", "-N", cf.chain)
-	if err != nil {
-		return err
-	}
-
-	return doIPTables("-t", "nat", "-A", "PREROUTING", cf.chainRule())
-}
-
-func (cf *config) deleteChain() error {
-	// First, remove any rules in the chain
-	err := doIPTables("-t", "nat", "-F", cf.chain)
-	if err != nil {
-		if _, ok := err.(ipTablesError); ok {
-			// this probably means the chain doesn't exist
-			return nil
-		}
-	}
-
-	// Remove the rule that references our chain from PREROUTING,
-	// if it's there.
-	for {
-		err := doIPTables("-t", "nat", "-D", "PREROUTING",
-			cf.chainRule())
-		if err != nil {
-			if _, ok := err.(ipTablesError); !ok {
-				return err
-			}
-
-			// a "no such rule" error
-			break
-		}
-	}
-
-	// Actually delete the chain at last
-	return doIPTables("-t", "nat", "-X", cf.chain)
-}
-
-func (cf *config) addRule(args []interface{}) error {
-	return cf.frobRule("-A", args)
-}
-
-func (cf *config) deleteRule(args []interface{}) error {
-	return cf.frobRule("-D", args)
-}
-
-func (cf *config) frobRule(op string, args []interface{}) error {
-	return doIPTables("-t", "nat", op, cf.chain, args)
 }
