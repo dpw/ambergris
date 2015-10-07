@@ -12,6 +12,10 @@ import (
 	"github.com/dpw/ambergris/interceptor/model"
 )
 
+// A simple control mechanism for the daemon via a unix socket.
+// Intended to prove out the main interceptor code and for testing
+// rather than as something to be used in anger.
+
 type Server struct {
 	errors   chan<- error
 	listener *net.UnixListener
