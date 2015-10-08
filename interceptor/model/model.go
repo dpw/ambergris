@@ -22,6 +22,8 @@ type Instance struct {
 	IPPort
 }
 
+func (i Instance) String() string { return i.IPPort.TCPAddr().String() }
+
 func MakeInstance(ip net.IP, port int) Instance {
 	return Instance{IPPort{string(ip), port}}
 }
@@ -31,6 +33,8 @@ type ServiceKey struct {
 	Type string
 	IPPort
 }
+
+func (s ServiceKey) String() string { return s.Type + ":" + s.IPPort.TCPAddr().String() }
 
 func MakeServiceKey(typ string, ip net.IP, port int) ServiceKey {
 	return ServiceKey{typ, IPPort{string(ip), port}}
