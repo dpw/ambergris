@@ -34,11 +34,17 @@ func Main() error {
 		return fmt.Errorf("excess command line arguments")
 	}
 
-	err := cf.setupChain()
+	err := cf.setupChain("nat", "PREROUTING")
 	if err != nil {
 		return err
 	}
-	defer cf.deleteChain()
+	defer cf.deleteChain("nat", "PREROUTING")
+
+	err = cf.setupChain("filter", "FORWARD", "INPUT")
+	if err != nil {
+		return err
+	}
+	defer cf.deleteChain("filter", "FORWARD", "INPUT")
 
 	errors := make(chan error, 1)
 
@@ -129,54 +135,95 @@ func (upd *updater) doUpdate(update model.ServiceUpdate) {
 
 		upd.services[update.ServiceKey] = svc
 	} else if update.ServiceInfo != nil {
-		svc.update(*update.ServiceInfo)
+		err := svc.update(update)
+		if err != nil {
+			upd.errors <- err
+			return
+		}
 	} else {
 		delete(upd.services, update.ServiceKey)
 		svc.close()
 	}
 }
 
-func fatal(a ...interface{}) {
-}
-
 type service struct {
-	config      *config
-	serviceAddr *net.TCPAddr
-	instances   []model.Instance
-	errors      chan<- error
+	config    *config
+	instances []model.Instance
+	errors    chan<- error
 
-	lock     sync.Mutex
-	listener *net.TCPListener
-	rule     []interface{}
-	closed   chan struct{}
+	lock sync.Mutex
+	stop stopForwarder
 }
+
+// The only thing a forwarder needs to expose is an operation to stop it
+type stopForwarder func()
 
 func (config *config) newService(upd model.ServiceUpdate, errors chan<- error) (*service, error) {
-	bridgeIP, err := config.bridgeIP()
+	svc := &service{
+		config:    config,
+		instances: upd.Instances,
+		errors:    errors,
+	}
+
+	err := svc.update(upd)
 	if err != nil {
 		return nil, err
 	}
 
-	svc := &service{
-		config:      config,
-		serviceAddr: upd.TCPAddr(),
-		instances:   upd.Instances,
-		errors:      errors,
-		closed:      make(chan struct{}),
+	return svc, nil
+}
+
+func (svc *service) update(upd model.ServiceUpdate) error {
+	svc.lock.Lock()
+	defer svc.lock.Unlock()
+
+	// start the new forwarder before stopping the old one, to
+	// avoid a window where there is no rule for the service
+	start := svc.startForwarding
+	if len(upd.Instances) == 0 {
+		start = svc.startRejecting
 	}
 
-	success := false
-	defer func() {
-		if !success {
-			svc.close()
-		}
-	}()
+	stop, err := start(upd)
+	if err != nil {
+		return err
+	}
+
+	if svc.stop != nil {
+		svc.stop()
+	}
+
+	svc.stop = stop
+	return nil
+}
+
+func (svc *service) close() {
+	svc.lock.Lock()
+	defer svc.lock.Unlock()
+
+	if svc.stop != nil {
+		svc.stop()
+		svc.stop = nil
+	}
+}
+
+func (svc *service) startForwarding(upd model.ServiceUpdate) (stopForwarder, error) {
+	bridgeIP, err := svc.config.bridgeIP()
+	if err != nil {
+		return nil, err
+	}
 
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
 	if err != nil {
 		return nil, err
 	}
-	svc.listener = listener
+
+	success := false
+	defer func() {
+		if !success {
+			listener.Close()
+		}
+	}()
 
 	rule := []interface{}{
 		"-p", "tcp",
@@ -185,19 +232,19 @@ func (config *config) newService(upd model.ServiceUpdate, errors chan<- error) (
 		"-j", "DNAT",
 		"--to-destination", listener.Addr(),
 	}
-	err = config.addRule(rule)
+	err = svc.config.addRule("nat", rule)
 	if err != nil {
 		return nil, err
 	}
-	svc.rule = rule
 
+	stop := make(chan struct{})
 	go func() {
 		for {
 			conn, err := listener.AcceptTCP()
 			if err != nil {
 				select {
-				case errors <- err:
-				case <-svc.closed:
+				case svc.errors <- err:
+				case <-stop:
 				}
 				return
 			}
@@ -207,7 +254,11 @@ func (config *config) newService(upd model.ServiceUpdate, errors chan<- error) (
 	}()
 
 	success = true
-	return svc, nil
+	return func() {
+		listener.Close()
+		close(stop)
+		svc.config.deleteRule("nat", rule)
+	}, nil
 }
 
 func (svc *service) forward(local *net.TCPConn) {
@@ -243,28 +294,22 @@ func (svc *service) pickInstance() model.Instance {
 	return svc.instances[rand.Intn(len(svc.instances))]
 }
 
-func (svc *service) update(info model.ServiceInfo) {
-	// handle the "no instances" case nicely, by changing the rule to
-	// REJECT.
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-	svc.instances = info.Instances
-}
-
-func (svc *service) close() {
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-
-	if svc.listener != nil {
-		svc.listener.Close()
-		close(svc.closed)
-		svc.listener = nil
+func (svc *service) startRejecting(upd model.ServiceUpdate) (stopForwarder, error) {
+	rule := []interface{}{
+		"-p", "tcp",
+		"-d", upd.IP(),
+		"--dport", upd.Port,
+		"-j", "REJECT",
 	}
 
-	if svc.rule != nil {
-		svc.config.deleteRule(svc.rule)
-		svc.rule = nil
+	err := svc.config.addRule("filter", rule)
+	if err != nil {
+		return nil, err
 	}
+
+	return func() {
+		svc.config.deleteRule("filter", rule)
+	}, nil
 }
 
 func (cf *config) bridgeIP() (net.IP, error) {

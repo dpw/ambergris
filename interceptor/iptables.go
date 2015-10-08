@@ -64,23 +64,30 @@ func doIPTables(args ...interface{}) error {
 	return nil
 }
 
-func (cf *config) setupChain() error {
-	err := cf.deleteChain()
+func (cf *config) setupChain(table string, hookChains ...string) error {
+	err := cf.deleteChain(table, hookChains...)
 	if err != nil {
 		return err
 	}
 
-	err = doIPTables("-t", "nat", "-N", cf.chain)
+	err = doIPTables("-t", table, "-N", cf.chain)
 	if err != nil {
 		return err
 	}
 
-	return doIPTables("-t", "nat", "-A", "PREROUTING", cf.chainRule())
+	for _, hookChain := range hookChains {
+		err = doIPTables("-t", table, "-I", hookChain, cf.chainRule())
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (cf *config) deleteChain() error {
+func (cf *config) deleteChain(table string, hookChains ...string) error {
 	// First, remove any rules in the chain
-	err := doIPTables("-t", "nat", "-F", cf.chain)
+	err := doIPTables("-t", table, "-F", cf.chain)
 	if err != nil {
 		if _, ok := err.(ipTablesError); ok {
 			// this probably means the chain doesn't exist
@@ -88,33 +95,34 @@ func (cf *config) deleteChain() error {
 		}
 	}
 
-	// Remove the rule that references our chain from PREROUTING,
-	// if it's there.
-	for {
-		err := doIPTables("-t", "nat", "-D", "PREROUTING",
-			cf.chainRule())
-		if err != nil {
-			if _, ok := err.(ipTablesError); !ok {
-				return err
-			}
+	// Remove rules that reference our chain
+	for _, hookChain := range hookChains {
+		for {
+			err := doIPTables("-t", table, "-D", hookChain,
+				cf.chainRule())
+			if err != nil {
+				if _, ok := err.(ipTablesError); !ok {
+					return err
+				}
 
-			// a "no such rule" error
-			break
+				// a "no such rule" error
+				break
+			}
 		}
 	}
 
-	// Actually delete the chain at last
-	return doIPTables("-t", "nat", "-X", cf.chain)
+	// Actually delete the chain
+	return doIPTables("-t", table, "-X", cf.chain)
 }
 
-func (cf *config) addRule(args []interface{}) error {
-	return cf.frobRule("-A", args)
+func (cf *config) addRule(table string, args []interface{}) error {
+	return cf.frobRule(table, "-A", args)
 }
 
-func (cf *config) deleteRule(args []interface{}) error {
-	return cf.frobRule("-D", args)
+func (cf *config) deleteRule(table string, args []interface{}) error {
+	return cf.frobRule(table, "-D", args)
 }
 
-func (cf *config) frobRule(op string, args []interface{}) error {
-	return doIPTables("-t", "nat", op, cf.chain, args)
+func (cf *config) frobRule(table string, op string, args []interface{}) error {
+	return doIPTables("-t", table, op, cf.chain, args)
 }
