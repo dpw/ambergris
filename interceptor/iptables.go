@@ -17,7 +17,7 @@ type ipTablesError struct {
 }
 
 func (err ipTablesError) Error() string {
-	return fmt.Sprintf("'iptables %s' gave error: ", err.cmd, err.output)
+	return fmt.Sprintf("'iptables %s' gave error: %s", err.cmd, err.output)
 }
 
 func flatten(args []interface{}, onto []string) []string {
