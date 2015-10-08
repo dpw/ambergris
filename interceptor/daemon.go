@@ -20,6 +20,11 @@ type config struct {
 	bridge string
 }
 
+type Controller interface {
+	Updates() <-chan model.ServiceUpdate
+	Close()
+}
+
 func Main() error {
 	var cf config
 
@@ -42,7 +47,8 @@ func Main() error {
 
 	errors := make(chan error, 1)
 
-	controlServer, err := simplecontrol.NewServer(errors)
+	var controlServer Controller
+	controlServer, err = simplecontrol.NewServer(errors)
 	if err != nil {
 		return err
 	}
