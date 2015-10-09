@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/dpw/ambergris/coatl"
 	"github.com/dpw/ambergris/interceptor/model"
 	"github.com/dpw/ambergris/interceptor/simplecontrol"
 )
@@ -18,6 +19,11 @@ import (
 type config struct {
 	chain  string
 	bridge string
+}
+
+type Controller interface {
+	Updates() <-chan model.ServiceUpdate
+	Close()
 }
 
 func Main() error {
@@ -48,7 +54,12 @@ func Main() error {
 
 	errors := make(chan error, 1)
 
-	controlServer, err := simplecontrol.NewServer(errors)
+	var controlServer Controller
+	if false {
+		controlServer, err = simplecontrol.NewServer(errors)
+	} else {
+		controlServer, err = coatl.NewListener(errors)
+	}
 	if err != nil {
 		return err
 	}
