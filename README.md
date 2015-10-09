@@ -15,6 +15,14 @@
 go get github.com/dpw/ambergris
 ```
 
+To build a Docker image,
+
+```
+make image
+```
+
+The resulting image is tagged `ambergris/server`.
+
 ## Use with plain docker
 
 ```
