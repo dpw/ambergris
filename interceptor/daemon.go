@@ -11,7 +11,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/bboreham/coatl/glisten"
+	"github.com/dpw/ambergris/coatl"
 	"github.com/dpw/ambergris/interceptor/model"
 	"github.com/dpw/ambergris/interceptor/simplecontrol"
 )
@@ -52,7 +52,7 @@ func Main() error {
 	if false {
 		controlServer, err = simplecontrol.NewServer(errors)
 	} else {
-		controlServer, err = glisten.NewListener(errors)
+		controlServer, err = coatl.NewListener(errors)
 	}
 	if err != nil {
 		return err
