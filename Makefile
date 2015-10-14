@@ -1,10 +1,4 @@
 PKG:=github.com/dpw/ambergris
-
-BUILD_ARGS:=-v $$PWD/build:/go \
-	    -v $$PWD/build-in-container.sh:/build.sh \
-	    --workdir=/go/src/$(PKG) \
-	    -e GOPATH=/go
-
 GOFILES:=$(shell find . -name '*.go')
 SRC:=main.go interceptor coatl
 
@@ -25,7 +19,8 @@ clean:
 	touch $@
 
 ambergris: .build.uptodate $(GOFILES) build-in-container.sh
-	mkdir -p ./build/src/$(PKG)/
-	cp -pR $(SRC) build/src/$(PKG)/
-	docker run --rm $(BUILD_ARGS) ambergris/build sh /build.sh
-	cp ./build/bin/ambergris $@
+	mkdir -p build/src/$(PKG)
+	cp -pr $(SRC) build/src/$(PKG)
+	docker run -v $$PWD/build:/go -v $$PWD/build-in-container.sh:/build.sh \
+	    --workdir=/go/src/$(PKG) -e GOPATH=/go ambergris/build sh /build.sh
+	cp build/bin/ambergris $@
