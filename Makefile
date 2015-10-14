@@ -19,6 +19,7 @@ clean:
 	touch $@
 
 ambergris: .build.uptodate $(GOFILES) build-in-container.sh
+	rm -rf build/src/$(PKG)
 	mkdir -p build/src/$(PKG)
 	cp -pr $(SRC) build/src/$(PKG)
 	docker run -v $$PWD/build:/go -v $$PWD/build-in-container.sh:/build.sh \
