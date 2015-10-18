@@ -24,7 +24,7 @@ ambergris: docker/.build.done docker/build-in-container.sh $(GOFILES)
 	rm -rf build/src/$(PKG)
 	mkdir -p build/src/$(PKG)
 	cp -pr $(SRC) build/src/$(PKG)
-	docker run -v $$PWD/build:/go \
+	docker run --rm -v $$PWD/build:/go \
 	    -v $$PWD/docker/build-in-container.sh:/build.sh \
 	    --workdir=/go/src/$(PKG) -e GOPATH=/go ambergris/build sh /build.sh
 	cp build/bin/ambergris $@
