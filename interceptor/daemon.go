@@ -28,12 +28,14 @@ type Controller interface {
 
 func Main() error {
 	var cf config
+	var useSimpleControl bool
 
 	// The bridge specified should be the one where packets sent
 	// to service IP addresses go.  So even with weave, that's
 	// typically 'docker0'.
 	flag.StringVar(&cf.bridge, "bridge", "docker0", "bridge device")
 	flag.StringVar(&cf.chain, "chain", "AMBERGRIS", "iptables chain name")
+	flag.BoolVar(&useSimpleControl, "s", false, "use the unix socket controller")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
@@ -55,7 +57,7 @@ func Main() error {
 	errors := make(chan error, 1)
 
 	var controlServer Controller
-	if false {
+	if useSimpleControl {
 		controlServer, err = simplecontrol.NewServer(errors)
 	} else {
 		controlServer, err = coatl.NewListener(errors)
