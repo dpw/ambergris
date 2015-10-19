@@ -117,6 +117,8 @@ func (upd *updater) close() {
 		for _, svc := range upd.services {
 			svc.close()
 		}
+
+		upd.services = nil
 	}
 }
 
@@ -162,9 +164,10 @@ func (upd *updater) doUpdate(update model.ServiceUpdate) {
 type service struct {
 	config *config
 	errors chan<- error
+	state  serviceState
 
-	lock  sync.Mutex
-	state serviceState
+	// No locking, because all operations are called only from the
+	// updater goroutine.
 }
 
 type serviceState interface {
@@ -187,9 +190,6 @@ func (config *config) newService(upd model.ServiceUpdate, errors chan<- error) (
 }
 
 func (svc *service) update(upd model.ServiceUpdate) error {
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-
 	if svc.state != nil {
 		ok, err := svc.state.update(upd)
 		if err != nil || ok {
@@ -218,13 +218,8 @@ func (svc *service) update(upd model.ServiceUpdate) error {
 }
 
 func (svc *service) close() {
-	svc.lock.Lock()
-	defer svc.lock.Unlock()
-
-	if svc.state != nil {
-		svc.state.stop()
-		svc.state = nil
-	}
+	svc.state.stop()
+	svc.state = nil
 }
 
 type forwarding struct {
@@ -232,6 +227,8 @@ type forwarding struct {
 	rule     []interface{}
 	listener *net.TCPListener
 	stopCh   chan struct{}
+
+	lock sync.Mutex
 	*model.ServiceUpdate
 }
 
@@ -301,7 +298,9 @@ func (fwd *forwarding) stop() {
 
 func (fwd *forwarding) update(udp model.ServiceUpdate) (bool, error) {
 	if len(udp.Instances) > 0 {
+		fwd.lock.Lock()
 		fwd.ServiceUpdate = &udp
+		fwd.lock.Unlock()
 		return true, nil
 	}
 
@@ -309,10 +308,7 @@ func (fwd *forwarding) update(udp model.ServiceUpdate) (bool, error) {
 }
 
 func (fwd *forwarding) forward(local *net.TCPConn) {
-	insts := fwd.Instances
-	inst := insts[rand.Intn(len(insts))]
-
-	remote, err := net.DialTCP("tcp", nil, inst.TCPAddr())
+	remote, err := net.DialTCP("tcp", nil, fwd.pickInstance().TCPAddr())
 	if remote == nil {
 		// XXX report error
 		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
@@ -336,6 +332,12 @@ func (fwd *forwarding) forward(local *net.TCPConn) {
 	<-ch
 	local.Close()
 	remote.Close()
+}
+
+func (fwd *forwarding) pickInstance() model.Instance {
+	fwd.lock.Lock()
+	defer fwd.lock.Unlock()
+	return fwd.Instances[rand.Intn(len(fwd.Instances))]
 }
 
 type rejecting func()
