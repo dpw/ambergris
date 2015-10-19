@@ -3,8 +3,6 @@ package interceptor
 import (
 	"flag"
 	"fmt"
-	"io"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -220,124 +218,6 @@ func (svc *service) update(upd model.ServiceUpdate) error {
 func (svc *service) close() {
 	svc.state.stop()
 	svc.state = nil
-}
-
-type forwarding struct {
-	*service
-	rule     []interface{}
-	listener *net.TCPListener
-	stopCh   chan struct{}
-
-	lock sync.Mutex
-	*model.ServiceUpdate
-}
-
-func (svc *service) startForwarding(upd model.ServiceUpdate) (serviceState, error) {
-	bridgeIP, err := svc.config.bridgeIP()
-	if err != nil {
-		return nil, err
-	}
-
-	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: bridgeIP})
-	if err != nil {
-		return nil, err
-	}
-
-	success := false
-	defer func() {
-		if !success {
-			listener.Close()
-		}
-	}()
-
-	rule := []interface{}{
-		"-p", "tcp",
-		"-d", upd.IP(),
-		"--dport", upd.Port,
-		"-j", "DNAT",
-		"--to-destination", listener.Addr(),
-	}
-	err = svc.config.addRule("nat", rule)
-	if err != nil {
-		return nil, err
-	}
-
-	fwd := &forwarding{
-		service:       svc,
-		rule:          rule,
-		listener:      listener,
-		stopCh:        make(chan struct{}),
-		ServiceUpdate: &upd,
-	}
-
-	go fwd.run()
-	success = true
-	return fwd, nil
-}
-
-func (fwd *forwarding) run() {
-	for {
-		conn, err := fwd.listener.AcceptTCP()
-		if err != nil {
-			select {
-			case fwd.errors <- err:
-			case <-fwd.stopCh:
-			}
-			return
-		}
-
-		go fwd.forward(conn)
-	}
-}
-
-func (fwd *forwarding) stop() {
-	fwd.listener.Close()
-	close(fwd.stopCh)
-	fwd.config.deleteRule("nat", fwd.rule)
-}
-
-func (fwd *forwarding) update(udp model.ServiceUpdate) (bool, error) {
-	if len(udp.Instances) > 0 {
-		fwd.lock.Lock()
-		fwd.ServiceUpdate = &udp
-		fwd.lock.Unlock()
-		return true, nil
-	}
-
-	return false, nil
-}
-
-func (fwd *forwarding) forward(local *net.TCPConn) {
-	remote, err := net.DialTCP("tcp", nil, fwd.pickInstance().TCPAddr())
-	if remote == nil {
-		// XXX report error
-		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
-		return
-	}
-
-	ch := make(chan struct{})
-	go func() {
-		io.Copy(local, remote)
-		// XXX report error
-		remote.CloseRead()
-		local.CloseWrite()
-		close(ch)
-	}()
-
-	io.Copy(remote, local)
-	// XXX report error
-	local.CloseRead()
-	remote.CloseWrite()
-
-	<-ch
-	local.Close()
-	remote.Close()
-}
-
-func (fwd *forwarding) pickInstance() model.Instance {
-	fwd.lock.Lock()
-	defer fwd.lock.Unlock()
-	return fwd.Instances[rand.Intn(len(fwd.Instances))]
 }
 
 type rejecting func()
