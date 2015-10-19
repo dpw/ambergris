@@ -104,10 +104,14 @@ func (fwd *forwarding) update(upd model.ServiceUpdate) (bool, error) {
 
 func (fwd *forwarding) chooseShim() {
 	name := fwd.Protocol
+	shim := tcpShim
+
 	switch fwd.Protocol {
-	case "":
-		fwd.shim = fwd.tcpShim
+	case "", "tcp":
 		name = "tcp"
+
+	case "http":
+		shim = httpShim
 
 	default:
 		log.Warn("service ", fwd.key, ": no support for protocol ",
@@ -115,6 +119,7 @@ func (fwd *forwarding) chooseShim() {
 		name = "tcp"
 	}
 
+	fwd.shim = shim
 	fwd.shimName = name
 }
 
@@ -143,7 +148,7 @@ func (fwd *forwarding) pickInstanceAndShim() (model.Instance, shimFunc, string) 
 	return fwd.Instances[rand.Intn(len(fwd.Instances))], fwd.shim, fwd.shimName
 }
 
-func (fwd *forwarding) tcpShim(inbound, outbound *net.TCPConn) error {
+func tcpShim(inbound, outbound *net.TCPConn) error {
 	ch := make(chan error, 1)
 	go func() {
 		var err error

@@ -110,7 +110,7 @@ func (srv *Server) doRequest(conn *net.UnixConn) error {
 	}
 
 	var insts []model.Instance
-	for _, inst := range parts[1:] {
+	for _, inst := range parts[2:] {
 		addr, err := net.ResolveTCPAddr("tcp", inst)
 		if err != nil {
 			return err
@@ -121,8 +121,10 @@ func (srv *Server) doRequest(conn *net.UnixConn) error {
 
 	var update model.ServiceUpdate
 	update.ServiceKey = model.MakeServiceKey("tcp", addr.IP, addr.Port)
-	update.ServiceInfo = &model.ServiceInfo{}
-	update.Instances = insts
+	update.ServiceInfo = &model.ServiceInfo{
+		Protocol:  parts[1],
+		Instances: insts,
+	}
 
 	select {
 	case srv.updates <- update:
