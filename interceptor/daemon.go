@@ -3,6 +3,7 @@ package interceptor
 import (
 	"flag"
 	"fmt"
+	log "github.com/Sirupsen/logrus"
 	"net"
 	"os"
 	"os/signal"
@@ -142,7 +143,8 @@ func (upd *updater) doUpdate(update model.ServiceUpdate) {
 
 		svc, err := upd.config.newService(update, upd.errors)
 		if err != nil {
-			upd.errors <- err
+			log.Error("adding service ", update.ServiceKey, ": ",
+				err)
 			return
 		}
 
@@ -150,7 +152,8 @@ func (upd *updater) doUpdate(update model.ServiceUpdate) {
 	} else if update.ServiceInfo != nil {
 		err := svc.update(update)
 		if err != nil {
-			upd.errors <- err
+			log.Error("updating service ", update.ServiceKey, ": ",
+				err)
 			return
 		}
 	} else {
@@ -161,6 +164,7 @@ func (upd *updater) doUpdate(update model.ServiceUpdate) {
 
 type service struct {
 	config *config
+	key    model.ServiceKey
 	errors chan<- error
 	state  serviceState
 
@@ -176,6 +180,7 @@ type serviceState interface {
 func (config *config) newService(upd model.ServiceUpdate, errors chan<- error) (*service, error) {
 	svc := &service{
 		config: config,
+		key:    upd.ServiceKey,
 		errors: errors,
 	}
 

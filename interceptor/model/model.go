@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"net"
 )
 
@@ -34,7 +35,9 @@ type ServiceKey struct {
 	IPPort
 }
 
-func (s ServiceKey) String() string { return s.Type + ":" + s.IPPort.TCPAddr().String() }
+func (s ServiceKey) String() string {
+	return fmt.Sprintf("%s:%s", s.Type, s.IPPort.TCPAddr().String())
+}
 
 func MakeServiceKey(typ string, ip net.IP, port int) ServiceKey {
 	return ServiceKey{typ, IPPort{string(ip), port}}

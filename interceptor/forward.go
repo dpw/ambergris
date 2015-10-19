@@ -1,11 +1,10 @@
 package interceptor
 
 import (
-	"fmt"
+	log "github.com/Sirupsen/logrus"
 	"io"
 	"math/rand"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/dpw/ambergris/interceptor/model"
@@ -19,7 +18,8 @@ type forwarding struct {
 
 	lock sync.Mutex
 	*model.ServiceInfo
-	shim shimFunc
+	shim     shimFunc
+	shimName string
 }
 
 type shimFunc func(inbound, outbound *net.TCPConn) error
@@ -62,7 +62,7 @@ func (svc *service) startForwarding(upd model.ServiceUpdate) (serviceState, erro
 		ServiceInfo: upd.ServiceInfo,
 	}
 
-	fwd.shim = fwd.chooseShim()
+	fwd.chooseShim()
 	go fwd.run()
 	success = true
 	return fwd, nil
@@ -72,6 +72,7 @@ func (fwd *forwarding) run() {
 	for {
 		conn, err := fwd.listener.AcceptTCP()
 		if err != nil {
+			// Seems like a fatal error
 			select {
 			case fwd.errors <- err:
 			case <-fwd.stopCh:
@@ -92,44 +93,54 @@ func (fwd *forwarding) stop() {
 func (fwd *forwarding) update(upd model.ServiceUpdate) (bool, error) {
 	if len(upd.Instances) > 0 {
 		fwd.lock.Lock()
+		defer fwd.lock.Unlock()
 		fwd.ServiceInfo = upd.ServiceInfo
-		fwd.shim = fwd.chooseShim()
-		fwd.lock.Unlock()
+		fwd.chooseShim()
 		return true, nil
 	}
 
 	return false, nil
 }
 
-func (fwd *forwarding) chooseShim() shimFunc {
+func (fwd *forwarding) chooseShim() {
+	name := fwd.Protocol
 	switch fwd.Protocol {
 	case "":
-		return fwd.tcpShim
+		fwd.shim = fwd.tcpShim
+		name = "tcp"
 
 	default:
-		// XXX log warning
-		return fwd.tcpShim
+		log.Warn("service ", fwd.key, ": no support for protocol ",
+			fwd.Protocol, ", falling back to TCP forwarding")
+		name = "tcp"
 	}
+
+	fwd.shimName = name
 }
 
 func (fwd *forwarding) forward(inbound *net.TCPConn) {
-	inst, shim := fwd.pickInstanceAndShim()
+	inst, shim, shimName := fwd.pickInstanceAndShim()
+	inAddr := inbound.RemoteAddr()
+	outAddr := inst.TCPAddr()
+	log.Info("forwarding ", shimName, " from ", inAddr, " to ", outAddr)
 
-	outbound, err := net.DialTCP("tcp", nil, inst.TCPAddr())
+	outbound, err := net.DialTCP("tcp", nil, outAddr)
 	if err != nil {
-		// XXX report error
-		fmt.Fprintf(os.Stderr, "remote dial failed: %v\n", err)
+		log.Error("connecting to ", outAddr, ": ", err)
 		return
 	}
 
-	shim(inbound, outbound)
-	// XXX handle errors from shim
+	err = shim(inbound, outbound)
+	if err != nil {
+		log.Error("forwarding from ", inAddr, " to ", outAddr, ": ",
+			err)
+	}
 }
 
-func (fwd *forwarding) pickInstanceAndShim() (model.Instance, shimFunc) {
+func (fwd *forwarding) pickInstanceAndShim() (model.Instance, shimFunc, string) {
 	fwd.lock.Lock()
 	defer fwd.lock.Unlock()
-	return fwd.Instances[rand.Intn(len(fwd.Instances))], fwd.shim
+	return fwd.Instances[rand.Intn(len(fwd.Instances))], fwd.shim, fwd.shimName
 }
 
 func (fwd *forwarding) tcpShim(inbound, outbound *net.TCPConn) error {
@@ -137,10 +148,15 @@ func (fwd *forwarding) tcpShim(inbound, outbound *net.TCPConn) error {
 	go func() {
 		var err error
 		defer func() { ch <- err }()
-		err = copyAndClose(inbound, outbound)
+		_, err = io.Copy(inbound, outbound)
+		outbound.CloseRead()
+		inbound.CloseWrite()
 	}()
 
-	err1 := copyAndClose(outbound, inbound)
+	_, err1 := io.Copy(outbound, inbound)
+	inbound.CloseRead()
+	outbound.CloseWrite()
+
 	err2 := <-ch
 	inbound.Close()
 	outbound.Close()
@@ -149,19 +165,5 @@ func (fwd *forwarding) tcpShim(inbound, outbound *net.TCPConn) error {
 		return err1
 	} else {
 		return err2
-	}
-}
-
-func copyAndClose(dst, src *net.TCPConn) error {
-	_, err1 := io.Copy(dst, src)
-	err2 := src.CloseRead()
-	err3 := dst.CloseWrite()
-	switch {
-	case err1 != nil:
-		return err1
-	case err2 != nil:
-		return err2
-	default:
-		return err3
 	}
 }
