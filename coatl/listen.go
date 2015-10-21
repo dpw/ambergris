@@ -23,7 +23,7 @@ func (l *Listener) send(serviceName string) error {
 	}
 	update := model.ServiceUpdate{
 		ServiceKey:  model.MakeServiceKey("tcp", net.ParseIP(service.Address), service.Port),
-		ServiceInfo: &model.ServiceInfo{},
+		ServiceInfo: &model.ServiceInfo{Protocol: service.Protocol},
 	}
 	l.backend.ForeachInstance(serviceName, func(name string, instance data.Instance) {
 		update.ServiceInfo.Instances = append(update.ServiceInfo.Instances, model.MakeInstance(net.ParseIP(instance.Address), instance.Port))
