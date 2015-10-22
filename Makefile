@@ -30,3 +30,10 @@ ambergris: docker/.build.done docker/build-wrapper.sh $(GOFILES)
 	cp -pr $(SRC) build/src/$(PKG)
 	$(run_build_container) "go get . && go build ."
 	cp build/bin/ambergris $@
+
+.PHONY: test
+test: docker/.build.done $(GOFILES)
+	rm -rf build/src/$(PKG)
+	mkdir -p build/src/$(PKG)
+	cp -pr $(SRC) build/src/$(PKG)
+	$(run_build_container) "cd interceptor && go get -t ./... && go test ./..."
