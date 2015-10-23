@@ -11,31 +11,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dpw/ambergris/interceptor/events"
+
 	"github.com/stretchr/testify/require"
 )
 
 type shimHarness struct {
-	listener *net.TCPListener
+	listener    *net.TCPListener
+	exchanges   []*events.HttpExchange
+	connections int
+	events.DiscardOthers
 }
 
 func wrapShim(shim shimFunc, target *net.TCPAddr, check func(error)) *shimHarness {
 	listener, err := net.ListenTCP("tcp", nil)
 	check(err)
 
+	h := &shimHarness{listener: listener}
+
 	go func() {
 		for {
 			inbound, err := listener.AcceptTCP()
 			check(err)
-
+			h.connections++
 			go func() {
 				outbound, err := net.DialTCP("tcp", nil, target)
 				check(err)
-				check(shim(inbound, outbound))
+				check(shim(inbound, outbound, h))
 			}()
 		}
 	}()
 
-	return &shimHarness{listener}
+	return h
 }
 
 func (h *shimHarness) addr() *net.TCPAddr {
@@ -46,15 +53,16 @@ func (h *shimHarness) stop() error {
 	return h.listener.Close()
 }
 
+func (h *shimHarness) HttpExchange(exch *events.HttpExchange) {
+	h.exchanges = append(h.exchanges, exch)
+}
+
 func TestHttp(t *testing.T) {
 	check := func(err error) {
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	l, err := net.ListenTCP("tcp", nil)
-	check(err)
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	randStr := func() string {
@@ -81,6 +89,9 @@ func TestHttp(t *testing.T) {
 		gotIn = read(req.Body)
 		w.Write(([]byte)(expectOut))
 	})
+
+	l, err := net.ListenTCP("tcp", nil)
+	check(err)
 	go func() { http.Serve(l, mux) }()
 
 	harness := wrapShim(httpShim, l.Addr().(*net.TCPAddr), check)
@@ -107,6 +118,11 @@ func TestHttp(t *testing.T) {
 
 	expectOut = randStr()
 	require.Equal(t, doGet(), expectOut)
+	require.Equal(t, "GET", harness.exchanges[0].Request.Method)
+	require.Equal(t, "/out", harness.exchanges[0].Request.URL.String())
+	require.Equal(t, 200, harness.exchanges[0].Response.StatusCode)
+	require.True(t, harness.exchanges[0].RoundTrip > 0*time.Second && harness.exchanges[0].RoundTrip < 100*time.Millisecond)
+	require.True(t, harness.exchanges[0].TotalTime > 0*time.Second && harness.exchanges[0].TotalTime < 100*time.Millisecond)
 
 	expectIn := randStr()
 	doPost(expectIn)
@@ -126,6 +142,11 @@ func TestHttp(t *testing.T) {
 	expectIn = randStr()
 	require.Equal(t, doPostInOut(expectIn), expectOut)
 	require.Equal(t, gotIn, expectIn)
+
+	require.Len(t, harness.exchanges, 6)
+
+	// should have re-used one connection for all requests
+	require.Equal(t, 1, harness.connections)
 
 	check(l.Close())
 	check(harness.stop())

@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/dpw/ambergris/interceptor/events"
 	"github.com/dpw/ambergris/interceptor/model"
 )
 
@@ -22,7 +23,7 @@ type forwarding struct {
 	shimName string
 }
 
-type shimFunc func(inbound, outbound *net.TCPConn) error
+type shimFunc func(inbound, outbound *net.TCPConn, eventHandler events.Handler) error
 
 func (svc *service) startForwarding(upd model.ServiceUpdate) (serviceState, error) {
 	bridgeIP, err := svc.config.bridgeIP()
@@ -125,9 +126,8 @@ func (fwd *forwarding) chooseShim() {
 
 func (fwd *forwarding) forward(inbound *net.TCPConn) {
 	inst, shim, shimName := fwd.pickInstanceAndShim()
-	inAddr := inbound.RemoteAddr()
+	inAddr := inbound.RemoteAddr().(*net.TCPAddr)
 	outAddr := inst.TCPAddr()
-	log.Info("forwarding ", shimName, " from ", inAddr, " to ", outAddr)
 
 	outbound, err := net.DialTCP("tcp", nil, outAddr)
 	if err != nil {
@@ -135,7 +135,12 @@ func (fwd *forwarding) forward(inbound *net.TCPConn) {
 		return
 	}
 
-	err = shim(inbound, outbound)
+	fwd.config.eventHandler.Connection(&events.Connection{
+		Inbound:  inAddr,
+		Outbound: outAddr,
+		Protocol: shimName,
+	})
+	err = shim(inbound, outbound, fwd.config.eventHandler)
 	if err != nil {
 		log.Error("forwarding from ", inAddr, " to ", outAddr, ": ",
 			err)
@@ -148,7 +153,7 @@ func (fwd *forwarding) pickInstanceAndShim() (model.Instance, shimFunc, string) 
 	return fwd.Instances[rand.Intn(len(fwd.Instances))], fwd.shim, fwd.shimName
 }
 
-func tcpShim(inbound, outbound *net.TCPConn) error {
+func tcpShim(inbound, outbound *net.TCPConn, eh events.Handler) error {
 	ch := make(chan error, 1)
 	go func() {
 		var err error

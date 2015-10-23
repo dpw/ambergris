@@ -11,13 +11,16 @@ import (
 	"syscall"
 
 	"github.com/dpw/ambergris/coatl"
+	"github.com/dpw/ambergris/interceptor/eventlogger"
+	"github.com/dpw/ambergris/interceptor/events"
 	"github.com/dpw/ambergris/interceptor/model"
 	"github.com/dpw/ambergris/interceptor/simplecontrol"
 )
 
 type config struct {
-	chain  string
-	bridge string
+	chain        string
+	bridge       string
+	eventHandler events.Handler
 }
 
 type Controller interface {
@@ -40,6 +43,8 @@ func Main() error {
 	if flag.NArg() > 0 {
 		return fmt.Errorf("excess command line arguments")
 	}
+
+	cf.eventHandler = eventlogger.EventLogger{}
 
 	err := cf.setupChain("nat", "PREROUTING")
 	if err != nil {
